@@ -1,54 +1,76 @@
 import { useEffect } from "react";
 import "@/App.css";
-import { BrowserRouter, Routes, Route } from "react-router-dom";
-import axios from "axios";
+import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import { Toaster } from "@/components/ui/sonner";
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
-const API = `${BACKEND_URL}/api`;
+import { AuthProvider, useAuth } from "@/contexts/AuthContext";
+import { MatchmakingProvider } from "@/contexts/MatchmakingContext";
+import ProtectedRoute from "@/components/ProtectedRoute";
+import Layout from "@/components/Layout";
+import MatchmakingDialog from "@/components/MatchmakingDialog";
 
-const Home = () => {
-  const helloWorldApi = async () => {
-    try {
-      const response = await axios.get(`${API}/`);
-      console.log(response.data.message);
-    } catch (e) {
-      console.error(e, `errored out requesting / api`);
-    }
-  };
+import Login from "@/pages/Login";
+import Register from "@/pages/Register";
+import Dashboard from "@/pages/Dashboard";
+import Profile from "@/pages/Profile";
+import UserProfile from "@/pages/UserProfile";
+import Leaderboard from "@/pages/Leaderboard";
+import Teams from "@/pages/Teams";
+import History from "@/pages/History";
+import Friends from "@/pages/Friends";
 
-  useEffect(() => {
-    helloWorldApi();
-  }, []);
+function PublicOnly({ children }) {
+    const { user, loading } = useAuth();
+    if (loading) return null;
+    if (user) return <Navigate to="/" replace />;
+    return children;
+}
 
-  return (
-    <div>
-      <header className="App-header">
-        <a
-          className="App-link"
-          href="https://emergent.sh"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <img src="https://avatars.githubusercontent.com/in/1201222?s=120&u=2686cf91179bbafbc7a71bfbc43004cf9ae1acea&v=4" />
-        </a>
-        <p className="mt-5">Building something incredible ~!</p>
-      </header>
-    </div>
-  );
-};
+function ShellRoutes() {
+    return (
+        <Routes>
+            <Route path="/login" element={<PublicOnly><Login /></PublicOnly>} />
+            <Route path="/register" element={<PublicOnly><Register /></PublicOnly>} />
+            <Route
+                path="/*"
+                element={
+                    <ProtectedRoute>
+                        <MatchmakingProvider>
+                            <Layout>
+                                <Routes>
+                                    <Route index element={<Dashboard />} />
+                                    <Route path="leaderboard" element={<Leaderboard />} />
+                                    <Route path="teams" element={<Teams />} />
+                                    <Route path="friends" element={<Friends />} />
+                                    <Route path="history" element={<History />} />
+                                    <Route path="profile" element={<Profile />} />
+                                    <Route path="users/:id" element={<UserProfile />} />
+                                    <Route path="*" element={<Navigate to="/" replace />} />
+                                </Routes>
+                            </Layout>
+                            <MatchmakingDialog />
+                        </MatchmakingProvider>
+                    </ProtectedRoute>
+                }
+            />
+        </Routes>
+    );
+}
 
 function App() {
-  return (
-    <div className="App">
-      <BrowserRouter>
-        <Routes>
-          <Route path="/" element={<Home />}>
-            <Route index element={<Home />} />
-          </Route>
-        </Routes>
-      </BrowserRouter>
-    </div>
-  );
+    useEffect(() => {
+        document.documentElement.classList.add("dark");
+    }, []);
+    return (
+        <div className="App">
+            <BrowserRouter>
+                <AuthProvider>
+                    <ShellRoutes />
+                </AuthProvider>
+            </BrowserRouter>
+            <Toaster richColors position="top-right" theme="dark" />
+        </div>
+    );
 }
 
 export default App;

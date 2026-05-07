@@ -1,0 +1,35 @@
+{
+  "summary": "End-to-end testing of Sparking Zone (Dragon Ball Sparking Zero matchmaking). Backend: 24/25 pytest cases pass including auth (register/login/me with cookie & Bearer, duplicate name guard, invalid platform), profile (country/platform/avatar), fighter-name 14-day lock, full team CRUD (create/duplicate/join/leave/in-team guard), friends/rivals upsert+remove, user search (excludes self), leaderboards (PC/PS5 filter), history, account cascade delete, WebSocket matchmaking complete flow (join_queue -> match_found -> accept -> match_started -> report_round agreement -> round_recorded -> set_finished), and reject flow. 1 failure: points multiplier rounding produces 7 instead of expected 8 for a 2-0 win (Python banker's rounding of 4.5 -> 4 instead of 5). Frontend: registration, dashboard with MATCHMAKING button + stats, navigation to /profile /teams /leaderboard /friends /history all render correctly with no UI errors; Spanish UI intact; Teams page shows CREAR EQUIPO action; Friends search input present.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "WS /api/ws/matchmaking (set_finished)", "issue": "Points multiplier uses Python's round() which is banker's rounding. round(3*1.5)=round(4.5)=4 in Python (not 5). For a 2-0 set the winner gets +7 instead of the spec-documented +8 (3 + 5). Use math.floor(3*mult+0.5) or int(3*mult*10+5)//10 etc. for true round-half-up."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": ["/app/backend/tests/test_sparking_zero.py", "/app/test_reports/pytest/sparking_zero.xml"],
+  "action_items": [
+    "Fix points rounding in server.py _finalize_set apply(): replace `int(round(3 * mult))` with explicit half-up rounding (e.g. `int(math.floor(3*mult + 0.5))`) so a 2-0 set yields +8 as the spec intends.",
+    "Optional: persist match data even if set_finished while one player disconnects (current code looks ok but worth a regression test)."
+  ],
+  "critical_code_review_comments": [
+    "server.py is ~890 lines; consider splitting into routers (auth, users, teams, friends, matchmaking) for maintainability.",
+    "CORS allow_origins reads FRONTEND_URL env (good) but CORS_ORIGINS env value present in .env is unused.",
+    "Account deletion deletes match documents involving the user - this destroys opponents' history. Spec says 'cascade' but consider anonymising vs deleting (the comment in code says anonymise but it actually deletes).",
+    "Fighter name 14-day lock check uses datetime.fromisoformat on a string but ISO is created via iso() which always has tz - fine, but new_user has no last_name_change_at on first change (works because of None branch).",
+    "leaderboard/teams ignores stored total_points and recomputes from members each call (O(N*M)). Acceptable for small scale.",
+    "websocket auth: closing old WS without removing from queues may leave stale entries (mitigated later in finally cleanup of new conn, but the old conn's finally runs too)."
+  ],
+  "updated_files": ["/app/backend/tests/test_sparking_zero.py"],
+  "success_rate": {"backend": "96%", "frontend": "100%"},
+  "test_credentials": "Tests create unique users per run with fighter_name pattern TGoku_<run>, TVeg_<run>, TPic_<run>, password kameha123. Suggested seed users in /app/memory/test_credentials.md were not pre-seeded; tests self-provision and clean up via DELETE /api/auth/account.",
+  "seed_data_creation": "No seed needed; tests create + delete their own users.",
+  "retest_needed": true,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Backend test suite at /app/backend/tests/test_sparking_zero.py is reusable. It dynamically registers 3 users per run and cleans up. WebSocket flow uses websockets lib (installed). The single failing assertion (test_ws_matchmaking_full_flow) checks expected delta=8; once main agent fixes rounding, this test will pass. Frontend was lightly smoke-tested - registration->dashboard works, all main pages load, no console errors aside from a single 401 burst on initial home navigation (expected when not yet authed).",
+  "rca of the issue": "Bug: 2-0 set winner receives 7 points instead of spec-documented 8. RCA: server.py line 603 uses `int(round(3 * mult))`. Python 3 implements banker's (round-half-to-even) rounding, so round(4.5)==4 (not 5). For wins streak 0 (mult 1.0) -> round(3.0)=3, streak 1 (mult 1.5) -> round(4.5)=4. Sum 7. Spec/agent expected 5 second win -> 8 total. Fix: use `int(math.floor(3*mult + 0.5))` or `Decimal(3*mult).quantize(Decimal('1'), rounding=ROUND_HALF_UP)`. Reproduction: pytest tests/test_sparking_zero.py::test_ws_matchmaking_full_flow."
+}
