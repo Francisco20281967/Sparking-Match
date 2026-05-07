@@ -18,6 +18,7 @@ import Leaderboard from "@/pages/Leaderboard";
 import Teams from "@/pages/Teams";
 import History from "@/pages/History";
 import Friends from "@/pages/Friends";
+import Admin from "@/pages/Admin";
 
 function PublicOnly({ children }) {
     const { user, loading } = useAuth();
@@ -45,6 +46,7 @@ function ShellRoutes() {
                                     <Route path="history" element={<History />} />
                                     <Route path="profile" element={<Profile />} />
                                     <Route path="users/:id" element={<UserProfile />} />
+                                    <Route path="admin" element={<Admin />} />
                                     <Route path="*" element={<Navigate to="/" replace />} />
                                 </Routes>
                             </Layout>

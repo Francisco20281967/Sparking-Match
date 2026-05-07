@@ -98,6 +98,8 @@ def serialize_user(u: dict, include_private: bool = False) -> dict:
         "sets_won": u.get("sets_won", 0),
         "sets_lost": u.get("sets_lost", 0),
         "rank": get_rank(u.get("points", 0)),
+        "role": u.get("role", "user"),
+        "banned": bool(u.get("banned", False)),
         "created_at": u.get("created_at"),
     }
     if include_private:
@@ -119,11 +121,24 @@ async def get_current_user(request: Request) -> dict:
         user = await db.users.find_one({"_id": payload["sub"]})
         if not user:
             raise HTTPException(status_code=401, detail="Usuario no encontrado")
+        if user.get("banned"):
+            raise HTTPException(status_code=403, detail="Esta cuenta ha sido baneada")
         return user
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expirado")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Token inválido")
+
+
+async def get_current_admin(user: dict = Depends(lambda r=None: None)) -> dict:
+    # placeholder; replaced below
+    raise HTTPException(status_code=403, detail="Acceso denegado")
+
+
+async def require_admin(user: dict = Depends(get_current_user)) -> dict:
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Se requiere acceso de administrador")
+    return user
 
 
 def set_auth_cookie(response: Response, token: str):
@@ -211,6 +226,8 @@ async def register(data: RegisterIn, response: Response):
         "total_losses": 0,
         "sets_won": 0,
         "sets_lost": 0,
+        "role": "user",
+        "banned": False,
         "last_name_change_at": None,
         "created_at": iso(now_utc()),
     }
@@ -225,6 +242,8 @@ async def login(data: LoginIn, response: Response):
     user = await db.users.find_one({"fighter_name_lower": data.fighter_name.lower()})
     if not user or not verify_password(data.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Credenciales inválidas")
+    if user.get("banned"):
+        raise HTTPException(status_code=403, detail="Esta cuenta ha sido baneada por el administrador")
     token = create_token(user["_id"])
     set_auth_cookie(response, token)
     return {"user": serialize_user(user, include_private=True), "token": token}
@@ -1068,6 +1087,272 @@ async def matchmaking_ws(ws: WebSocket):
                         await _send(c, {"type": "opponent_disconnected", "match_id": conn.match_id})
 
 
+# ===== Admin Routes =====
+class AdminUserUpdateIn(BaseModel):
+    fighter_name: Optional[str] = None
+    country: Optional[str] = None
+    platform: Optional[str] = None
+    points: Optional[int] = None
+    win_streak: Optional[int] = None
+    best_streak: Optional[int] = None
+    total_wins: Optional[int] = None
+    total_losses: Optional[int] = None
+    sets_won: Optional[int] = None
+    sets_lost: Optional[int] = None
+    banned: Optional[bool] = None
+    role: Optional[str] = None
+    password: Optional[str] = None
+    team_id: Optional[str] = None  # use empty string "" to clear
+
+
+class AdminTeamUpdateIn(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    logo: Optional[str] = None
+
+
+@api.get("/admin/users")
+async def admin_list_users(q: str = "", admin: dict = Depends(require_admin)):
+    query: Dict[str, Any] = {}
+    if q and len(q) >= 1:
+        query["fighter_name_lower"] = {"$regex": q.lower()}
+    users = await db.users.find(query, {"password_hash": 0}).sort("points", -1).limit(500).to_list(500)
+    return [serialize_user(u, include_private=True) for u in users]
+
+
+@api.put("/admin/users/{user_id}")
+async def admin_update_user(user_id: str, data: AdminUserUpdateIn, admin: dict = Depends(require_admin)):
+    target = await db.users.find_one({"_id": user_id})
+    if not target:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    update: Dict[str, Any] = {}
+
+    if data.fighter_name is not None:
+        new_name = data.fighter_name.strip()
+        if not new_name:
+            raise HTTPException(status_code=400, detail="Nombre inválido")
+        new_lower = new_name.lower()
+        if new_lower != target["fighter_name_lower"]:
+            existing = await db.users.find_one({"fighter_name_lower": new_lower})
+            if existing:
+                raise HTTPException(status_code=400, detail="Ese nombre ya está en uso")
+        update["fighter_name"] = new_name
+        update["fighter_name_lower"] = new_lower
+
+    if data.country is not None:
+        update["country"] = data.country or None
+    if data.platform is not None:
+        if data.platform not in ("PC", "PS5"):
+            raise HTTPException(status_code=400, detail="Plataforma inválida")
+        update["platform"] = data.platform
+    if data.win_streak is not None:
+        update["win_streak"] = max(0, int(data.win_streak))
+    if data.best_streak is not None:
+        update["best_streak"] = max(0, int(data.best_streak))
+    if data.total_wins is not None:
+        update["total_wins"] = max(0, int(data.total_wins))
+    if data.total_losses is not None:
+        update["total_losses"] = max(0, int(data.total_losses))
+    if data.sets_won is not None:
+        update["sets_won"] = max(0, int(data.sets_won))
+    if data.sets_lost is not None:
+        update["sets_lost"] = max(0, int(data.sets_lost))
+    if data.banned is not None:
+        # Cannot ban yourself or another admin
+        if target["_id"] == admin["_id"] and data.banned:
+            raise HTTPException(status_code=400, detail="No puedes banearte a ti mismo")
+        if target.get("role") == "admin" and data.banned:
+            raise HTTPException(status_code=400, detail="No puedes banear a otro administrador")
+        update["banned"] = bool(data.banned)
+    if data.role is not None:
+        if data.role not in ("user", "admin"):
+            raise HTTPException(status_code=400, detail="Rol inválido")
+        # Prevent removing the last admin (don't downgrade self if no other admin)
+        if target["_id"] == admin["_id"] and data.role != "admin":
+            count_admins = await db.users.count_documents({"role": "admin"})
+            if count_admins <= 1:
+                raise HTTPException(status_code=400, detail="No puedes quitarte el rol siendo el único admin")
+        update["role"] = data.role
+    if data.password is not None:
+        if len(data.password) < 4:
+            raise HTTPException(status_code=400, detail="Contraseña demasiado corta")
+        update["password_hash"] = hash_password(data.password)
+
+    # Points: also update team total_points delta
+    points_delta = 0
+    if data.points is not None:
+        new_pts = max(0, int(data.points))
+        points_delta = new_pts - target.get("points", 0)
+        update["points"] = new_pts
+
+    # Team change
+    if data.team_id is not None:
+        if data.team_id == "":
+            # leave team
+            if target.get("team_id"):
+                await db.teams.update_one(
+                    {"_id": target["team_id"]},
+                    {"$pull": {"members": target["_id"]}, "$inc": {"total_points": -target.get("points", 0)}},
+                )
+                t_after = await db.teams.find_one({"_id": target["team_id"]})
+                if t_after and not t_after.get("members"):
+                    await db.teams.delete_one({"_id": target["team_id"]})
+            update["team_id"] = None
+            update["team_name"] = None
+        else:
+            new_team = await db.teams.find_one({"_id": data.team_id})
+            if not new_team:
+                raise HTTPException(status_code=404, detail="Equipo no encontrado")
+            # Remove from old team
+            if target.get("team_id") and target["team_id"] != data.team_id:
+                await db.teams.update_one(
+                    {"_id": target["team_id"]},
+                    {"$pull": {"members": target["_id"]}, "$inc": {"total_points": -target.get("points", 0)}},
+                )
+                t_after = await db.teams.find_one({"_id": target["team_id"]})
+                if t_after and not t_after.get("members"):
+                    await db.teams.delete_one({"_id": target["team_id"]})
+            await db.teams.update_one(
+                {"_id": data.team_id},
+                {"$addToSet": {"members": target["_id"]}, "$inc": {"total_points": target.get("points", 0)}},
+            )
+            update["team_id"] = data.team_id
+            update["team_name"] = new_team["name"]
+
+    if update:
+        await db.users.update_one({"_id": user_id}, {"$set": update})
+        # Apply points delta to current team if not changing teams
+        if points_delta != 0 and target.get("team_id") and (data.team_id is None or data.team_id == target.get("team_id")):
+            await db.teams.update_one({"_id": target["team_id"]}, {"$inc": {"total_points": points_delta}})
+
+    new_user = await db.users.find_one({"_id": user_id})
+    return serialize_user(new_user, include_private=True)
+
+
+@api.delete("/admin/users/{user_id}")
+async def admin_delete_user(user_id: str, admin: dict = Depends(require_admin)):
+    if user_id == admin["_id"]:
+        raise HTTPException(status_code=400, detail="No puedes eliminarte a ti mismo")
+    target = await db.users.find_one({"_id": user_id})
+    if not target:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    if target.get("role") == "admin":
+        count_admins = await db.users.count_documents({"role": "admin"})
+        if count_admins <= 1:
+            raise HTTPException(status_code=400, detail="No puedes eliminar al único administrador")
+    if target.get("team_id"):
+        await db.teams.update_one(
+            {"_id": target["team_id"]},
+            {"$pull": {"members": user_id}, "$inc": {"total_points": -target.get("points", 0)}},
+        )
+        t_after = await db.teams.find_one({"_id": target["team_id"]})
+        if t_after and not t_after.get("members"):
+            await db.teams.delete_one({"_id": target["team_id"]})
+    await db.friendships.delete_many({"$or": [{"owner_id": user_id}, {"target_id": user_id}]})
+    await db.matches.delete_many({"players": user_id})
+    await db.users.delete_one({"_id": user_id})
+    return {"ok": True}
+
+
+@api.post("/admin/users/{user_id}/ban")
+async def admin_toggle_ban(user_id: str, admin: dict = Depends(require_admin)):
+    if user_id == admin["_id"]:
+        raise HTTPException(status_code=400, detail="No puedes banearte a ti mismo")
+    target = await db.users.find_one({"_id": user_id})
+    if not target:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    if target.get("role") == "admin":
+        raise HTTPException(status_code=400, detail="No puedes banear a otro administrador")
+    new_banned = not bool(target.get("banned"))
+    await db.users.update_one({"_id": user_id}, {"$set": {"banned": new_banned}})
+    new_user = await db.users.find_one({"_id": user_id})
+    return serialize_user(new_user, include_private=True)
+
+
+@api.get("/admin/teams")
+async def admin_list_teams(admin: dict = Depends(require_admin)):
+    teams = await db.teams.find({}).sort("total_points", -1).to_list(500)
+    return [
+        {
+            "id": t["_id"],
+            "name": t["name"],
+            "description": t.get("description", ""),
+            "logo": t.get("logo"),
+            "owner_id": t["owner_id"],
+            "member_count": len(t.get("members", [])),
+            "total_points": t.get("total_points", 0),
+            "created_at": t.get("created_at"),
+        }
+        for t in teams
+    ]
+
+
+@api.put("/admin/teams/{team_id}")
+async def admin_update_team(team_id: str, data: AdminTeamUpdateIn, admin: dict = Depends(require_admin)):
+    t = await db.teams.find_one({"_id": team_id})
+    if not t:
+        raise HTTPException(status_code=404, detail="Equipo no encontrado")
+    update: Dict[str, Any] = {}
+    if data.name is not None:
+        new_name = data.name.strip()
+        if len(new_name) < 3:
+            raise HTTPException(status_code=400, detail="Nombre demasiado corto")
+        new_lower = new_name.lower()
+        if new_lower != t["name_lower"]:
+            existing = await db.teams.find_one({"name_lower": new_lower})
+            if existing:
+                raise HTTPException(status_code=400, detail="Nombre de equipo en uso")
+        update["name"] = new_name
+        update["name_lower"] = new_lower
+    if data.description is not None:
+        update["description"] = data.description[:240]
+    if data.logo is not None:
+        if data.logo and len(data.logo) > 800_000:
+            raise HTTPException(status_code=400, detail="Logo demasiado grande")
+        update["logo"] = data.logo or None
+    if update:
+        await db.teams.update_one({"_id": team_id}, {"$set": update})
+        if "name" in update:
+            await db.users.update_many({"team_id": team_id}, {"$set": {"team_name": update["name"]}})
+    new_t = await db.teams.find_one({"_id": team_id})
+    return {
+        "id": new_t["_id"],
+        "name": new_t["name"],
+        "description": new_t.get("description", ""),
+        "logo": new_t.get("logo"),
+        "owner_id": new_t["owner_id"],
+        "member_count": len(new_t.get("members", [])),
+        "total_points": new_t.get("total_points", 0),
+    }
+
+
+@api.delete("/admin/teams/{team_id}")
+async def admin_delete_team(team_id: str, admin: dict = Depends(require_admin)):
+    t = await db.teams.find_one({"_id": team_id})
+    if not t:
+        raise HTTPException(status_code=404, detail="Equipo no encontrado")
+    # Unset team for all members
+    await db.users.update_many({"team_id": team_id}, {"$set": {"team_id": None, "team_name": None}})
+    await db.teams.delete_one({"_id": team_id})
+    return {"ok": True}
+
+
+@api.get("/admin/stats")
+async def admin_stats(admin: dict = Depends(require_admin)):
+    total_users = await db.users.count_documents({})
+    total_teams = await db.teams.count_documents({})
+    total_matches = await db.matches.count_documents({})
+    banned = await db.users.count_documents({"banned": True})
+    return {
+        "total_users": total_users,
+        "total_teams": total_teams,
+        "total_matches": total_matches,
+        "banned": banned,
+        "online": len(set(list(last_seen.keys()) + list(connections.keys()))),
+        "active_matches": len(active_matches),
+    }
+
+
 # ===== Health =====
 @api.get("/")
 async def root():
@@ -1104,6 +1389,42 @@ async def on_startup():
     await db.matches.create_index([("players", 1)])
     await db.matches.create_index([("finished_at", -1)])
     await db.friendships.create_index([("owner_id", 1), ("target_id", 1)], unique=True)
+    # Seed admin
+    admin_name = os.environ.get("ADMIN_NAME", "Francis_UI")
+    admin_pwd = os.environ.get("ADMIN_PASSWORD", "Dokkanbattle28@")
+    admin_lower = admin_name.lower()
+    existing = await db.users.find_one({"fighter_name_lower": admin_lower})
+    if not existing:
+        await db.users.insert_one({
+            "_id": str(uuid.uuid4()),
+            "fighter_name": admin_name,
+            "fighter_name_lower": admin_lower,
+            "password_hash": hash_password(admin_pwd),
+            "platform": "PC",
+            "country": None,
+            "avatar": None,
+            "team_id": None,
+            "team_name": None,
+            "points": 0,
+            "win_streak": 0,
+            "best_streak": 0,
+            "total_wins": 0,
+            "total_losses": 0,
+            "sets_won": 0,
+            "sets_lost": 0,
+            "role": "admin",
+            "banned": False,
+            "last_name_change_at": None,
+            "created_at": iso(now_utc()),
+        })
+        logger.info(f"Admin seeded: {admin_name}")
+    else:
+        # Ensure role is admin and banned is false; resync password if changed
+        update: Dict[str, Any] = {"role": "admin", "banned": False}
+        if not verify_password(admin_pwd, existing.get("password_hash", "")):
+            update["password_hash"] = hash_password(admin_pwd)
+        await db.users.update_one({"_id": existing["_id"]}, {"$set": update})
+        logger.info(f"Admin synced: {admin_name}")
     logger.info("Startup complete")
 
 

@@ -3,7 +3,7 @@ import { useAuth } from "@/contexts/AuthContext";
 import { useMatchmaking } from "@/contexts/MatchmakingContext";
 import FighterAvatar from "@/components/FighterAvatar";
 import RankBadge from "@/components/RankBadge";
-import { LogOut, Trophy, Swords, Shield, Users, History as HistoryIcon, User, Heart, Wifi, WifiOff } from "lucide-react";
+import { LogOut, Trophy, Swords, Shield, Users, History as HistoryIcon, User, Heart, Wifi, WifiOff, Crown } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
 const navItems = [
@@ -15,6 +15,8 @@ const navItems = [
     { to: "/profile", label: "Perfil", icon: User },
 ];
 
+const adminNavItem = { to: "/admin", label: "Admin", icon: Crown };
+
 export default function Layout({ children }) {
     const { user, logout } = useAuth();
     const { connected } = useMatchmaking();
@@ -24,6 +26,8 @@ export default function Layout({ children }) {
         await logout();
         navigate("/login");
     };
+
+    const items = user?.role === "admin" ? [...navItems, adminNavItem] : navItems;
 
     return (
         <div className="min-h-screen flex flex-col relative">
@@ -39,7 +43,7 @@ export default function Layout({ children }) {
                         </div>
                     </Link>
                     <nav className="hidden lg:flex items-center gap-1">
-                        {navItems.map((it) => (
+                        {items.map((it) => (
                             <NavLink
                                 key={it.to}
                                 to={it.to}
@@ -47,7 +51,7 @@ export default function Layout({ children }) {
                                 data-testid={`nav-${it.label.toLowerCase()}`}
                                 className={({ isActive }) =>
                                     `font-display tracking-widest uppercase text-xs px-3 py-2 rounded-sm flex items-center gap-2 transition-all ${
-                                        isActive ? "text-ki-gold bg-ki-gold/10" : "text-zinc-400 hover:text-white"
+                                        isActive ? (it.to === "/admin" ? "text-ki-red bg-red-500/10" : "text-ki-gold bg-ki-gold/10") : (it.to === "/admin" ? "text-red-300 hover:text-red-100" : "text-zinc-400 hover:text-white")
                                     }`
                                 }
                             >
@@ -78,15 +82,15 @@ export default function Layout({ children }) {
                 </div>
                 {/* Mobile nav */}
                 <div className="lg:hidden border-t border-white/5">
-                    <div className="max-w-7xl mx-auto px-2 py-2 grid grid-cols-6 gap-1">
-                        {navItems.map((it) => (
+                    <div className={`max-w-7xl mx-auto px-2 py-2 grid ${items.length > 6 ? "grid-cols-7" : "grid-cols-6"} gap-1`}>
+                        {items.map((it) => (
                             <NavLink
                                 key={it.to}
                                 to={it.to}
                                 end={it.to === "/"}
                                 className={({ isActive }) =>
                                     `flex flex-col items-center gap-0.5 py-2 rounded-sm text-[9px] uppercase tracking-widest font-display ${
-                                        isActive ? "text-ki-gold" : "text-zinc-500"
+                                        isActive ? (it.to === "/admin" ? "text-ki-red" : "text-ki-gold") : "text-zinc-500"
                                     }`
                                 }
                             >
