@@ -600,7 +600,8 @@ async def _finalize_set(match_id: str):
         # apply each win sequentially using current streak multiplier
         for _ in range(wins):
             mult = get_multiplier(streak)
-            total_points_change += int(round(3 * mult))
+            # half-up rounding (avoid Python's banker's rounding so spec values match)
+            total_points_change += int(3 * mult + 0.5)
             streak += 1
         # losses: -1 each, reset streak after first loss
         for i in range(losses):
