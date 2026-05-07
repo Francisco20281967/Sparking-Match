@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMatchmaking } from "@/contexts/MatchmakingContext";
 import { useAuth } from "@/contexts/AuthContext";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
@@ -13,14 +13,17 @@ export default function MatchmakingDialog() {
     const { state, acceptMatch, rejectMatch, reportRound, requestRematch, leaveMatch, leaveQueue } = useMatchmaking();
     const { user } = useAuth();
     const [flash, setFlash] = useState(false);
+    const prevStatus = useRef(state.status);
 
     useEffect(() => {
-        if (state.lastEvent === "match_found") {
+        if (prevStatus.current !== "match_found" && state.status === "match_found") {
             setFlash(true);
             const t = setTimeout(() => setFlash(false), 600);
+            prevStatus.current = state.status;
             return () => clearTimeout(t);
         }
-    }, [state.lastEvent]);
+        prevStatus.current = state.status;
+    }, [state.status]);
 
     const open = ["queued", "match_found", "in_progress", "finished", "rejected"].includes(state.status);
 

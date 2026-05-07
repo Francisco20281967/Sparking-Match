@@ -1,0 +1,41 @@
+{
+  "summary": "Iteration 2 - REST polling matchmaking migration validated end-to-end. Backend pytest 34/34 (25 prior WS-based + 9 new REST tests at /api/match/*). Dual-browser E2E confirmed: register two users, both queue, both see mm-match-found within ~3s, both accept -> mm-in-progress, agree round 1 + 2 -> mm-finished with UserA showing VICTORIA +8 PUNTOS and UserB DERROTA -2 PUNTOS. Dashboard correctly updates (8 PTS, x2 racha, 100% win rate, 2 wins, 1 set won). Rematch: both POST -> new mm-match-found. Reject: closes dialogs and resets to idle. Cancel queue (alone): closes dialog. The points-rounding bug from iteration_1 (banker's rounding giving 7 instead of 8) is FIXED.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "GET /api/match/state online counter", "issue": "online count uses last_seen + connections set union, but last_seen entries expire after 30s only on subsequent calls; small drift but functional."},
+      {"endpoint": "POST /api/match/round disagreement", "issue": "On disagreement pending_reports is cleared but no event signal is exposed via REST state for the UI to show 'desacuerdo' (only WS broadcasts round_disagreement). Frontend will silently re-prompt."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_match_rest.py",
+    "/app/backend/tests/test_sparking_zero.py",
+    "/app/test_reports/pytest/match_rest.xml",
+    "/app/test_reports/pytest/sparking_zero.xml"
+  ],
+  "action_items": [
+    "Optional: surface round 'disagreement' signal in REST /match/state (e.g., disagreement_at timestamp echoed to client) so the UI can show a Spanish toast like 'No coinciden los reportes; vuelve a votar'.",
+    "Optional: GET /api/match/state currently returns 'rejected' status only briefly (until next /queue or /leave). Frontend transitions it to idle correctly via leaveMatch on dialog close - low priority.",
+    "Optional: Refactor server.py (~1100 lines) into routers (auth/users/teams/friends/matchmaking) for maintainability."
+  ],
+  "critical_code_review_comments": [
+    "server.py grew to ~1110 lines with REST + WS sharing the same in-memory state - acceptable but split into modules recommended.",
+    "In-memory matchmaking state is single-process. If backend ever scales horizontally (more than 1 worker/pod) the state will desync. Document or pin to single worker.",
+    "/api/match/state writes to last_seen on every poll; with 1.5s polling per client this is fine in-memory but consider rate-limiting / debouncing if exposed to many users.",
+    "/api/match/queue accepts the call after a finished match without auto-leaving the previous match (pass-through). Frontend handles via explicit /leave - acceptable but documented behavior.",
+    "Account deletion still hard-deletes match documents that involve the user (line 253) - this destroys the opponent's history. Consider anonymizing instead."
+  ],
+  "updated_files": ["/app/backend/tests/test_match_rest.py"],
+  "success_rate": {"backend": "100%", "frontend": "100%"},
+  "test_credentials": "Tests self-provision unique users (TR_A_*, TR_B_*, UA*, UB*) with password 'kameha123' and clean up via DELETE /api/auth/account.",
+  "seed_data_creation": "None required; tests create + delete own users.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "REST polling endpoints under /api/match/{state,queue,dequeue,accept,reject,round,rematch,leave} are fully covered by /app/backend/tests/test_match_rest.py (9 tests). Old WS suite at /app/backend/tests/test_sparking_zero.py (25 tests) still passes since WS endpoint is unchanged. Frontend dual-context Playwright flow proven working: register form has 1 fighter_name input + 2 password inputs (password + confirm). After register, app navigates to '/' (dashboard renders at root) - wait for [data-testid='matchmaking-button'] not URL pattern.",
+  "rca of the issue": "No new bugs found this iteration. The points-rounding bug reported in iteration_1 (winner +7 instead of +8 due to Python banker's rounding) has been fixed in server.py _finalize_set apply() using `int(3 * mult + 0.5)` half-up rounding. Verified live in the dashboard: streak-1 winner of a 2-0 set receives +8 pts (3 + 5)."
+}

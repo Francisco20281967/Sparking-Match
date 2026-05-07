@@ -13,24 +13,19 @@ import { Swords, Flame, Trophy, Zap, Target, Users, ShieldAlert } from "lucide-r
 export default function Dashboard() {
     const { user } = useAuth();
     const { connected, joinQueue, leaveQueue, state } = useMatchmaking();
-    const [stats, setStats] = useState({ online: 0, queue_pc: 0, queue_ps5: 0 });
     const [recent, setRecent] = useState([]);
 
     useEffect(() => {
         let active = true;
         const load = async () => {
             try {
-                const [s, h] = await Promise.all([
-                    api.get("/stats"),
-                    api.get("/history"),
-                ]);
+                const { data } = await api.get("/history");
                 if (!active) return;
-                setStats(s.data);
-                setRecent(h.data.slice(0, 3));
+                setRecent(data.slice(0, 3));
             } catch {}
         };
         load();
-        const t = setInterval(load, 5000);
+        const t = setInterval(load, 8000);
         return () => { active = false; clearInterval(t); };
     }, [user?.points]);
 
@@ -103,9 +98,9 @@ export default function Dashboard() {
                         <span className="relative z-10">{queueing ? "CANCELAR" : "MATCHMAKING"}</span>
                     </button>
                     <div className="flex flex-wrap items-center gap-6 text-xs uppercase tracking-widest font-display text-zinc-400 z-10">
-                        <span className="flex items-center gap-2"><Users className="w-3 h-3 text-emerald-400" /> {stats.online} en línea</span>
-                        <span className="flex items-center gap-2"><Target className="w-3 h-3 text-cyan-400" /> {stats.queue_pc} en cola PC</span>
-                        <span className="flex items-center gap-2"><Target className="w-3 h-3 text-blue-400" /> {stats.queue_ps5} en cola PS5</span>
+                        <span className="flex items-center gap-2"><Users className="w-3 h-3 text-emerald-400" /> {state.online} en línea</span>
+                        <span className="flex items-center gap-2"><Target className="w-3 h-3 text-cyan-400" /> {state.queue_pc} en cola PC</span>
+                        <span className="flex items-center gap-2"><Target className="w-3 h-3 text-blue-400" /> {state.queue_ps5} en cola PS5</span>
                     </div>
                 </div>
             </section>

@@ -523,7 +523,7 @@ async def get_history(user: dict = Depends(get_current_user)):
     return out
 
 
-# ===== Matchmaking WebSocket =====
+# ===== Matchmaking (REST + WebSocket) =====
 class MMConnection:
     def __init__(self, user: dict, ws: WebSocket):
         self.user = user
@@ -531,10 +531,13 @@ class MMConnection:
         self.match_id: Optional[str] = None
 
 
-# In-memory state (acceptable for single-process, dev usage)
-queues: Dict[str, List[MMConnection]] = {"PC": [], "PS5": []}
-connections: Dict[str, MMConnection] = {}  # user_id -> MMConnection
-active_matches: Dict[str, dict] = {}  # match_id -> match state in memory
+# In-memory state
+queues: Dict[str, List[str]] = {"PC": [], "PS5": []}  # platform -> list of user_ids
+queued_users: set = set()  # user_ids currently queued
+connections: Dict[str, MMConnection] = {}  # user_id -> MMConnection (WS clients only)
+active_matches: Dict[str, dict] = {}  # match_id -> match state
+user_match: Dict[str, str] = {}  # user_id -> match_id
+last_seen: Dict[str, datetime] = {}  # user_id -> last activity (for "online" count via REST polling)
 mm_lock = asyncio.Lock()
 
 
@@ -545,41 +548,67 @@ async def _send(conn: MMConnection, msg: dict):
         logger.warning(f"send failed: {e}")
 
 
+async def _broadcast(match_id: str, msg: dict):
+    """Send a WS message to any WS-connected players in the match (REST clients ignore)."""
+    state = active_matches.get(match_id)
+    if not state:
+        return
+    for uid in state["players"]:
+        c = connections.get(uid)
+        if c:
+            await _send(c, msg)
+
+
 def _public_player(u: dict) -> dict:
     return serialize_user(u)
 
 
-async def _start_match(p1: MMConnection, p2: MMConnection):
+async def _start_match(uid1: str, uid2: str):
+    u1 = await db.users.find_one({"_id": uid1})
+    u2 = await db.users.find_one({"_id": uid2})
+    if not u1 or not u2:
+        return
     match_id = str(uuid.uuid4())
     state = {
         "id": match_id,
-        "players": [p1.user["_id"], p2.user["_id"]],
-        "user_objects": {p1.user["_id"]: p1.user, p2.user["_id"]: p2.user},
+        "players": [uid1, uid2],
+        "user_objects": {uid1: u1, uid2: u2},
         "accepts": set(),
         "rejects": set(),
         "rematches": set(),
-        "scores": {p1.user["_id"]: 0, p2.user["_id"]: 0},
-        "rounds": [],  # list of {winner_id}
-        "status": "pending",  # pending->accepted->in_progress->finished
+        "scores": {uid1: 0, uid2: 0},
+        "rounds": [],
+        "status": "pending",  # pending -> in_progress -> finished/rejected
+        "set_winner_id": None,
+        "points_delta": {uid1: 0, uid2: 0},
+        "pending_reports": {},
         "created_at": iso(now_utc()),
     }
     active_matches[match_id] = state
-    p1.match_id = match_id
-    p2.match_id = match_id
-    await _send(p1, {"type": "match_found", "match_id": match_id, "opponent": _public_player(p2.user)})
-    await _send(p2, {"type": "match_found", "match_id": match_id, "opponent": _public_player(p1.user)})
+    user_match[uid1] = match_id
+    user_match[uid2] = match_id
+    # Optional WS notify
+    c1 = connections.get(uid1)
+    c2 = connections.get(uid2)
+    if c1:
+        c1.match_id = match_id
+        await _send(c1, {"type": "match_found", "match_id": match_id, "opponent": _public_player(u2)})
+    if c2:
+        c2.match_id = match_id
+        await _send(c2, {"type": "match_found", "match_id": match_id, "opponent": _public_player(u1)})
 
 
 async def _try_pair(platform: str):
     q = queues[platform]
     while len(q) >= 2:
-        p1 = q.pop(0)
-        p2 = q.pop(0)
-        await _start_match(p1, p2)
+        u1 = q.pop(0)
+        u2 = q.pop(0)
+        queued_users.discard(u1)
+        queued_users.discard(u2)
+        await _start_match(u1, u2)
 
 
 async def _finalize_set(match_id: str):
-    """Apply points based on final set score."""
     state = active_matches.get(match_id)
     if not state or state["status"] == "finished":
         return
@@ -589,28 +618,23 @@ async def _finalize_set(match_id: str):
     state["status"] = "finished"
     state["finished_at"] = iso(now_utc())
 
-    # Apply points per round won/lost (each individual match)
-    # For each player: wins = scores; losses = opponent_scores
     async def apply(uid: str, wins: int, losses: int, set_won: bool):
         u = await db.users.find_one({"_id": uid})
         if not u:
             return 0
         streak = u.get("win_streak", 0)
-        total_points_change = 0
-        # apply each win sequentially using current streak multiplier
+        total = 0
         for _ in range(wins):
             mult = get_multiplier(streak)
-            # half-up rounding (avoid Python's banker's rounding so spec values match)
-            total_points_change += int(3 * mult + 0.5)
+            total += int(3 * mult + 0.5)
             streak += 1
-        # losses: -1 each, reset streak after first loss
         for i in range(losses):
-            total_points_change -= 1
+            total -= 1
             if i == 0:
                 streak = 0
-        new_points = max(0, u.get("points", 0) + total_points_change)
+        new_points = max(0, u.get("points", 0) + total)
         best_streak = max(u.get("best_streak", 0), streak)
-        update = {
+        await db.users.update_one({"_id": uid}, {"$set": {
             "points": new_points,
             "win_streak": streak,
             "best_streak": best_streak,
@@ -618,19 +642,18 @@ async def _finalize_set(match_id: str):
             "total_losses": u.get("total_losses", 0) + losses,
             "sets_won": u.get("sets_won", 0) + (1 if set_won else 0),
             "sets_lost": u.get("sets_lost", 0) + (0 if set_won else 1),
-        }
-        await db.users.update_one({"_id": uid}, {"$set": update})
-        # Update team total_points
+        }})
         if u.get("team_id"):
             await db.teams.update_one({"_id": u["team_id"]}, {"$inc": {"total_points": new_points - u.get("points", 0)}})
-        return total_points_change
+        return total
 
     p1_won = s1 > s2
     p2_won = s2 > s1
     delta1 = await apply(p1, s1, s2, p1_won)
     delta2 = await apply(p2, s2, s1, p2_won)
+    state["points_delta"] = {p1: delta1, p2: delta2}
+    state["set_winner_id"] = p1 if p1_won else (p2 if p2_won else None)
 
-    # Persist match
     await db.matches.insert_one({
         "_id": match_id,
         "players": state["players"],
@@ -641,164 +664,362 @@ async def _finalize_set(match_id: str):
         "finished_at": state["finished_at"],
     })
 
-    # Notify both
+    # WS notify
     for uid in state["players"]:
-        conn = connections.get(uid)
-        if conn:
+        c = connections.get(uid)
+        if c:
             u = await db.users.find_one({"_id": uid})
-            await _send(conn, {
+            await _send(c, {
                 "type": "set_finished",
                 "match_id": match_id,
                 "scores": state["scores"],
-                "winner_id": p1 if p1_won else (p2 if p2_won else None),
+                "winner_id": state["set_winner_id"],
                 "points_delta": delta1 if uid == p1 else delta2,
                 "user": serialize_user(u, include_private=True),
             })
 
 
+def _user_state(uid: str, current_user: dict) -> dict:
+    """Compute the full match state for a single user (REST polling response)."""
+    out = {
+        "status": "idle",
+        "match_id": None,
+        "opponent": None,
+        "scores": {},
+        "rounds": [],
+        "i_accepted": False,
+        "opponent_accepted": False,
+        "i_want_rematch": False,
+        "opponent_wants_rematch": False,
+        "set_winner_id": None,
+        "points_delta": 0,
+        "pending_round_report": False,
+        "online": len(last_seen),
+        "queue_pc": len(queues["PC"]),
+        "queue_ps5": len(queues["PS5"]),
+    }
+    if uid in queued_users:
+        out["status"] = "queued"
+        return out
+    mid = user_match.get(uid)
+    if not mid or mid not in active_matches:
+        return out
+    m = active_matches[mid]
+    opp_id = next((p for p in m["players"] if p != uid), None)
+    out["match_id"] = mid
+    out["opponent"] = serialize_user(m["user_objects"].get(opp_id)) if opp_id else None
+    out["scores"] = {pid: m["scores"].get(pid, 0) for pid in m["players"]}
+    out["rounds"] = list(m["rounds"])
+    out["i_accepted"] = uid in m["accepts"]
+    out["opponent_accepted"] = (opp_id in m["accepts"]) if opp_id else False
+    out["i_want_rematch"] = uid in m["rematches"]
+    out["opponent_wants_rematch"] = (opp_id in m["rematches"]) if opp_id else False
+    out["set_winner_id"] = m.get("set_winner_id")
+    pd = m.get("points_delta", {})
+    out["points_delta"] = pd.get(uid, 0)
+    out["pending_round_report"] = uid in m.get("pending_reports", {})
+    if m["status"] == "pending":
+        out["status"] = "match_found"
+    elif m["status"] == "in_progress":
+        out["status"] = "in_progress"
+    elif m["status"] == "finished":
+        out["status"] = "finished"
+    elif m["status"] == "rejected":
+        out["status"] = "rejected"
+    return out
+
+
+# Pydantic for round report
+class RoundIn(BaseModel):
+    winner_id: str
+
+
+# ===== REST endpoints (preferred by frontend) =====
+@api.get("/match/state")
+async def match_state(user: dict = Depends(get_current_user)):
+    last_seen[user["_id"]] = now_utc()
+    # Cleanup last_seen older than 30s
+    cutoff = now_utc() - timedelta(seconds=30)
+    stale = [uid for uid, ts in last_seen.items() if ts < cutoff]
+    for uid in stale:
+        last_seen.pop(uid, None)
+    return _user_state(user["_id"], user)
+
+
+@api.post("/match/queue")
+async def match_queue(user: dict = Depends(get_current_user)):
+    uid = user["_id"]
+    last_seen[uid] = now_utc()
+    async with mm_lock:
+        # already in active match
+        mid = user_match.get(uid)
+        if mid and mid in active_matches and active_matches[mid]["status"] != "finished":
+            return _user_state(uid, user)
+        # already finished match - clear it
+        if mid and mid in active_matches and active_matches[mid]["status"] == "finished":
+            # don't auto-leave; require explicit /match/leave or /match/rematch
+            pass
+        platform = user.get("platform", "PC")
+        if platform not in queues:
+            platform = "PC"
+        # remove duplicates
+        queues[platform] = [u for u in queues[platform] if u != uid]
+        queues[platform].append(uid)
+        queued_users.add(uid)
+        await _try_pair(platform)
+    return _user_state(uid, user)
+
+
+@api.post("/match/dequeue")
+async def match_dequeue(user: dict = Depends(get_current_user)):
+    uid = user["_id"]
+    last_seen[uid] = now_utc()
+    async with mm_lock:
+        for p in queues:
+            queues[p] = [u for u in queues[p] if u != uid]
+        queued_users.discard(uid)
+    return _user_state(uid, user)
+
+
+@api.post("/match/accept")
+async def match_accept(user: dict = Depends(get_current_user)):
+    uid = user["_id"]
+    last_seen[uid] = now_utc()
+    mid = user_match.get(uid)
+    if not mid or mid not in active_matches:
+        raise HTTPException(status_code=404, detail="No hay match activo")
+    m = active_matches[mid]
+    if m["status"] not in ("pending", "in_progress"):
+        raise HTTPException(status_code=400, detail="El match no está disponible")
+    m["accepts"].add(uid)
+    if len(m["accepts"]) == 2 and m["status"] == "pending":
+        m["status"] = "in_progress"
+    return _user_state(uid, user)
+
+
+@api.post("/match/reject")
+async def match_reject(user: dict = Depends(get_current_user)):
+    uid = user["_id"]
+    last_seen[uid] = now_utc()
+    mid = user_match.get(uid)
+    if not mid or mid not in active_matches:
+        return _user_state(uid, user)
+    m = active_matches[mid]
+    if m["status"] == "finished":
+        return _user_state(uid, user)
+    m["status"] = "rejected"
+    for pid in m["players"]:
+        if user_match.get(pid) == mid:
+            user_match.pop(pid, None)
+    # delete match record
+    active_matches.pop(mid, None)
+    return _user_state(uid, user)
+
+
+@api.post("/match/round")
+async def match_round(data: RoundIn, user: dict = Depends(get_current_user)):
+    uid = user["_id"]
+    last_seen[uid] = now_utc()
+    mid = user_match.get(uid)
+    if not mid or mid not in active_matches:
+        raise HTTPException(status_code=404, detail="No hay match activo")
+    m = active_matches[mid]
+    if m["status"] != "in_progress":
+        raise HTTPException(status_code=400, detail="Match no en curso")
+    if data.winner_id not in m["players"]:
+        raise HTTPException(status_code=400, detail="Ganador inválido")
+    pending = m.setdefault("pending_reports", {})
+    pending[uid] = data.winner_id
+    if len(pending) == 2:
+        if len(set(pending.values())) == 1:
+            w = next(iter(set(pending.values())))
+            m["rounds"].append({"winner_id": w})
+            m["scores"][w] = m["scores"].get(w, 0) + 1
+            m["pending_reports"] = {}
+            p1, p2 = m["players"]
+            ended = m["scores"][p1] >= 2 or m["scores"][p2] >= 2 or len(m["rounds"]) >= 3
+            if ended:
+                await _finalize_set(mid)
+        else:
+            # disagreement: clear and ask again
+            m["pending_reports"] = {}
+            m["disagreement_at"] = iso(now_utc())
+    return _user_state(uid, user)
+
+
+@api.post("/match/rematch")
+async def match_rematch(user: dict = Depends(get_current_user)):
+    uid = user["_id"]
+    last_seen[uid] = now_utc()
+    mid = user_match.get(uid)
+    if not mid or mid not in active_matches:
+        raise HTTPException(status_code=404, detail="Sin match")
+    m = active_matches[mid]
+    if m["status"] != "finished":
+        raise HTTPException(status_code=400, detail="El set aún no ha finalizado")
+    m["rematches"].add(uid)
+    if len(m["rematches"]) == 2:
+        p1, p2 = m["players"]
+        active_matches.pop(mid, None)
+        user_match.pop(p1, None)
+        user_match.pop(p2, None)
+        await _start_match(p1, p2)
+    return _user_state(uid, user)
+
+
+@api.post("/match/leave")
+async def match_leave(user: dict = Depends(get_current_user)):
+    uid = user["_id"]
+    last_seen[uid] = now_utc()
+    mid = user_match.get(uid)
+    if mid and mid in active_matches:
+        m = active_matches[mid]
+        if m["status"] == "finished":
+            user_match.pop(uid, None)
+            # if both left, clean up
+            other = next((p for p in m["players"] if p != uid), None)
+            if other and user_match.get(other) != mid:
+                active_matches.pop(mid, None)
+        else:
+            # abort match for everyone
+            for pid in m["players"]:
+                user_match.pop(pid, None)
+            active_matches.pop(mid, None)
+    # also leave queue
+    for p in queues:
+        queues[p] = [u for u in queues[p] if u != uid]
+    queued_users.discard(uid)
+    return _user_state(uid, user)
+
+
+# ===== WebSocket (legacy / power users) =====
 async def _handle_message(conn: MMConnection, msg: dict):
     msg_type = msg.get("type")
+    uid = conn.user["_id"]
 
     if msg_type == "join_queue":
         async with mm_lock:
             platform = conn.user.get("platform", "PC")
             if platform not in queues:
                 platform = "PC"
-            # Avoid duplicates
-            queues[platform] = [c for c in queues[platform] if c.user["_id"] != conn.user["_id"]]
-            queues[platform].append(conn)
+            queues[platform] = [u for u in queues[platform] if u != uid]
+            queues[platform].append(uid)
+            queued_users.add(uid)
             await _send(conn, {"type": "queued", "platform": platform, "position": len(queues[platform])})
             await _try_pair(platform)
         return
 
     if msg_type == "leave_queue":
         async with mm_lock:
-            for p, q in queues.items():
-                queues[p] = [c for c in q if c.user["_id"] != conn.user["_id"]]
+            for p in queues:
+                queues[p] = [u for u in queues[p] if u != uid]
+            queued_users.discard(uid)
             await _send(conn, {"type": "queue_left"})
         return
 
     if msg_type == "accept":
-        match_id = msg.get("match_id") or conn.match_id
-        state = active_matches.get(match_id)
-        if not state or conn.user["_id"] not in state["players"]:
+        mid = msg.get("match_id") or conn.match_id or user_match.get(uid)
+        m = active_matches.get(mid)
+        if not m or uid not in m["players"]:
             return
-        state["accepts"].add(conn.user["_id"])
-        if len(state["accepts"]) == 2:
-            state["status"] = "in_progress"
-            for uid in state["players"]:
-                c = connections.get(uid)
-                if c:
-                    await _send(c, {"type": "match_started", "match_id": match_id})
+        m["accepts"].add(uid)
+        if len(m["accepts"]) == 2:
+            m["status"] = "in_progress"
+            await _broadcast(mid, {"type": "match_started", "match_id": mid})
         else:
-            # notify other that opponent accepted
-            for uid in state["players"]:
-                if uid != conn.user["_id"]:
-                    c = connections.get(uid)
+            for pid in m["players"]:
+                if pid != uid:
+                    c = connections.get(pid)
                     if c:
-                        await _send(c, {"type": "opponent_accepted", "match_id": match_id})
+                        await _send(c, {"type": "opponent_accepted", "match_id": mid})
         return
 
     if msg_type == "reject":
-        match_id = msg.get("match_id") or conn.match_id
-        state = active_matches.get(match_id)
-        if not state:
+        mid = msg.get("match_id") or conn.match_id or user_match.get(uid)
+        m = active_matches.get(mid)
+        if not m:
             return
-        state["status"] = "rejected"
-        for uid in state["players"]:
-            c = connections.get(uid)
+        m["status"] = "rejected"
+        await _broadcast(mid, {"type": "match_rejected", "match_id": mid, "by": uid})
+        for pid in m["players"]:
+            user_match.pop(pid, None)
+            c = connections.get(pid)
             if c:
-                await _send(c, {"type": "match_rejected", "match_id": match_id, "by": conn.user["_id"]})
                 c.match_id = None
-        active_matches.pop(match_id, None)
+        active_matches.pop(mid, None)
         return
 
     if msg_type == "report_round":
-        # winner_id of a single round
-        match_id = msg.get("match_id") or conn.match_id
+        mid = msg.get("match_id") or conn.match_id or user_match.get(uid)
         winner_id = msg.get("winner_id")
-        state = active_matches.get(match_id)
-        if not state or state["status"] != "in_progress":
+        m = active_matches.get(mid)
+        if not m or m["status"] != "in_progress":
             return
-        if winner_id not in state["players"]:
+        if winner_id not in m["players"]:
             return
-        # Both players must report; we accept first report and treat second as confirmation if matches
-        # store pending reports
-        pending = state.setdefault("pending_reports", {})
-        pending[conn.user["_id"]] = winner_id
+        pending = m.setdefault("pending_reports", {})
+        pending[uid] = winner_id
         if len(pending) == 2:
-            # if both agree, record
-            uniq = set(pending.values())
-            if len(uniq) == 1:
-                w = uniq.pop()
-                state["rounds"].append({"winner_id": w})
-                state["scores"][w] = state["scores"].get(w, 0) + 1
-                state["pending_reports"] = {}
-                # check set end: best of 3 (first to 2 OR 3 rounds played)
-                p1, p2 = state["players"]
-                ended = state["scores"][p1] >= 2 or state["scores"][p2] >= 2 or len(state["rounds"]) >= 3
-                for uid in state["players"]:
-                    c = connections.get(uid)
-                    if c:
-                        await _send(c, {
-                            "type": "round_recorded",
-                            "match_id": match_id,
-                            "winner_id": w,
-                            "scores": state["scores"],
-                            "round": len(state["rounds"]),
-                        })
+            if len(set(pending.values())) == 1:
+                w = next(iter(set(pending.values())))
+                m["rounds"].append({"winner_id": w})
+                m["scores"][w] = m["scores"].get(w, 0) + 1
+                m["pending_reports"] = {}
+                p1, p2 = m["players"]
+                ended = m["scores"][p1] >= 2 or m["scores"][p2] >= 2 or len(m["rounds"]) >= 3
+                await _broadcast(mid, {
+                    "type": "round_recorded",
+                    "match_id": mid,
+                    "winner_id": w,
+                    "scores": m["scores"],
+                    "round": len(m["rounds"]),
+                })
                 if ended:
-                    await _finalize_set(match_id)
+                    await _finalize_set(mid)
             else:
-                # disagreement: clear and ask again
-                state["pending_reports"] = {}
-                for uid in state["players"]:
-                    c = connections.get(uid)
-                    if c:
-                        await _send(c, {"type": "round_disagreement", "match_id": match_id})
+                m["pending_reports"] = {}
+                await _broadcast(mid, {"type": "round_disagreement", "match_id": mid})
         else:
-            # ack
-            await _send(conn, {"type": "round_pending", "match_id": match_id})
+            await _send(conn, {"type": "round_pending", "match_id": mid})
         return
 
     if msg_type == "rematch":
-        match_id = msg.get("match_id") or conn.match_id
-        state = active_matches.get(match_id)
-        if not state or state["status"] != "finished":
+        mid = msg.get("match_id") or conn.match_id or user_match.get(uid)
+        m = active_matches.get(mid)
+        if not m or m["status"] != "finished":
             return
-        state["rematches"].add(conn.user["_id"])
-        if len(state["rematches"]) == 2:
-            # start a brand new match
-            p1_id, p2_id = state["players"]
-            c1 = connections.get(p1_id)
-            c2 = connections.get(p2_id)
-            active_matches.pop(match_id, None)
-            if c1 and c2:
-                await _start_match(c1, c2)
+        m["rematches"].add(uid)
+        if len(m["rematches"]) == 2:
+            p1, p2 = m["players"]
+            active_matches.pop(mid, None)
+            user_match.pop(p1, None)
+            user_match.pop(p2, None)
+            await _start_match(p1, p2)
         else:
-            for uid in state["players"]:
-                if uid != conn.user["_id"]:
-                    c = connections.get(uid)
+            for pid in m["players"]:
+                if pid != uid:
+                    c = connections.get(pid)
                     if c:
-                        await _send(c, {"type": "opponent_wants_rematch", "match_id": match_id})
+                        await _send(c, {"type": "opponent_wants_rematch", "match_id": mid})
         return
 
     if msg_type == "leave_match":
-        match_id = msg.get("match_id") or conn.match_id
-        state = active_matches.get(match_id)
-        if state:
-            for uid in state["players"]:
-                c = connections.get(uid)
+        mid = msg.get("match_id") or conn.match_id or user_match.get(uid)
+        m = active_matches.get(mid)
+        if m:
+            for pid in m["players"]:
+                user_match.pop(pid, None)
+                c = connections.get(pid)
                 if c:
-                    await _send(c, {"type": "opponent_left", "match_id": match_id})
+                    if pid != uid:
+                        await _send(c, {"type": "opponent_left", "match_id": mid})
                     c.match_id = None
-            active_matches.pop(match_id, None)
+            active_matches.pop(mid, None)
         return
 
 
 @app.websocket("/api/ws/matchmaking")
 async def matchmaking_ws(ws: WebSocket):
-    # Auth via query param 'token'
     token = ws.query_params.get("token")
     if not token:
         await ws.close(code=4401)
@@ -815,7 +1036,6 @@ async def matchmaking_ws(ws: WebSocket):
 
     await ws.accept()
     conn = MMConnection(user, ws)
-    # If existing connection, close it
     old = connections.get(user["_id"])
     if old:
         try:
@@ -824,7 +1044,6 @@ async def matchmaking_ws(ws: WebSocket):
             pass
     connections[user["_id"]] = conn
     await _send(conn, {"type": "connected", "user": serialize_user(user, include_private=True)})
-
     try:
         while True:
             data = await ws.receive_json()
@@ -834,13 +1053,12 @@ async def matchmaking_ws(ws: WebSocket):
     except Exception as e:
         logger.warning(f"ws error: {e}")
     finally:
-        # Cleanup
         async with mm_lock:
-            for p, q in queues.items():
-                queues[p] = [c for c in q if c.user["_id"] != user["_id"]]
+            for p in queues:
+                queues[p] = [u for u in queues[p] if u != user["_id"]]
+            queued_users.discard(user["_id"])
         if connections.get(user["_id"]) is conn:
             connections.pop(user["_id"], None)
-        # Notify opponent if in active match
         if conn.match_id and conn.match_id in active_matches:
             state = active_matches[conn.match_id]
             for uid in state["players"]:
@@ -853,13 +1071,14 @@ async def matchmaking_ws(ws: WebSocket):
 # ===== Health =====
 @api.get("/")
 async def root():
-    return {"message": "Sparking Zero API", "online": len(connections)}
+    return {"message": "Sparking Zero API", "online": len(last_seen) + len(connections)}
 
 
 @api.get("/stats")
 async def stats(user: dict = Depends(get_current_user)):
+    last_seen[user["_id"]] = now_utc()
     return {
-        "online": len(connections),
+        "online": len(set(list(last_seen.keys()) + list(connections.keys()))),
         "queue_pc": len(queues["PC"]),
         "queue_ps5": len(queues["PS5"]),
     }
